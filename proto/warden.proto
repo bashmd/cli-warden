@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package warden;
+
+service Warden {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc ExecuteStream(stream ExecuteStreamRequest) returns (stream ExecuteStreamEvent);
+  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+}
+
+message ExecuteRequest {
+  string cmd = 1;
+  repeated string args = 2;
+  string stdin_utf8 = 3;
+  string intent = 4;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_EXECUTED = 1;
+  OUTCOME_DENIED = 2;
+  OUTCOME_CANCELLED = 3;
+  OUTCOME_USER_REPLY = 4;
+  OUTCOME_ERROR = 5;
+}
+
+message ExecuteResponse {
+  Outcome outcome = 1;
+  int32 exit_code = 2;
+  string stdout_utf8 = 3;
+  string stderr_utf8 = 4;
+  string message = 5;
+}
+
+message ExecuteStart {
+  string cmd = 1;
+  repeated string args = 2;
+  string intent = 3;
+}
+
+message ExecuteStreamRequest {
+  oneof payload {
+    ExecuteStart start = 1;
+    bytes stdin_chunk = 2;
+    bool stdin_eof = 3;
+  }
+}
+
+message ExecuteDone {
+  Outcome outcome = 1;
+  int32 exit_code = 2;
+  string message = 3;
+}
+
+message ExecuteStreamEvent {
+  oneof payload {
+    string stdout_utf8 = 1;
+    string stderr_utf8 = 2;
+    ExecuteDone done = 3;
+  }
+}
+
+message ListCommandsRequest {}
+
+message ListCommandsResponse {
+  repeated string command_ids = 1;
+}
