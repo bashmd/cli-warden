@@ -39,47 +39,38 @@ impl Redactor {
         matcher.replace_all(text, &replacements)
     }
 
-    pub fn max_secret_len_bytes(&self) -> usize {
-        self.secrets.iter().map(|s| s.len()).max().unwrap_or(0)
-    }
-
-    pub fn stable_prefix_len(&self, text: &str) -> usize {
+    pub fn trailing_secret_prefix_len(&self, text: &str) -> usize {
         if text.is_empty() {
             return 0;
         }
         if self.secrets.is_empty() {
-            return text.len();
+            return 0;
         }
-
-        let max_secret_len = self.max_secret_len_bytes();
-        if max_secret_len <= 1 {
-            return text.len();
-        }
-        if text.len() < max_secret_len {
+        if self.secrets.iter().any(|secret| text.ends_with(secret)) {
             return 0;
         }
 
-        let matcher = self.matcher.as_ref().expect("matcher present with secrets");
-        let mut stable_end = text.len() - (max_secret_len - 1);
+        let mut best = 0usize;
+        for secret in &self.secrets {
+            if secret.len() <= 1 {
+                continue;
+            }
 
-        loop {
-            let mut changed = false;
-            for mat in matcher.find_overlapping_iter(text) {
-                if mat.start() < stable_end && mat.end() > stable_end {
-                    stable_end = mat.start();
-                    changed = true;
-                    break;
+            for (prefix_len, _) in secret.char_indices().skip(1) {
+                if prefix_len <= best || prefix_len >= secret.len() || prefix_len > text.len() {
+                    continue;
+                }
+                if !text.is_char_boundary(text.len() - prefix_len) {
+                    continue;
+                }
+
+                if text[text.len() - prefix_len..] == secret[..prefix_len] {
+                    best = prefix_len;
                 }
             }
-            if !changed {
-                break;
-            }
         }
 
-        while stable_end > 0 && !text.is_char_boundary(stable_end) {
-            stable_end -= 1;
-        }
-        stable_end
+        best
     }
 }
 
@@ -94,4 +85,34 @@ pub fn load_secrets(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
         out.push(trimmed.to_string());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Redactor;
+
+    #[test]
+    fn trailing_secret_prefix_len_detects_suffix_candidate() {
+        let redactor =
+            Redactor::from_secrets(vec!["TOPSECRET".to_string()]).expect("build redactor");
+        assert_eq!(redactor.trailing_secret_prefix_len("abcTOPSEC"), 6);
+    }
+
+    #[test]
+    fn trailing_secret_prefix_len_returns_zero_without_candidate() {
+        let redactor =
+            Redactor::from_secrets(vec!["TOPSECRET".to_string()]).expect("build redactor");
+        assert_eq!(redactor.trailing_secret_prefix_len("abcXYZ"), 0);
+        assert_eq!(redactor.trailing_secret_prefix_len("TOPSECRET"), 0);
+    }
+
+    #[test]
+    fn trailing_secret_prefix_len_supports_multibyte_boundaries() {
+        let redactor =
+            Redactor::from_secrets(vec!["secrét-value".to_string()]).expect("build redactor");
+        assert_eq!(
+            redactor.trailing_secret_prefix_len("prefix secré"),
+            "secré".len()
+        );
+    }
 }

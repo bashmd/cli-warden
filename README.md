@@ -210,6 +210,7 @@ All are treated as `cancel`.
 - Queue capacity is bounded (`128` packets).
 - In-flight byte budget is bounded (`128 KiB`) in both directions.
 - stdout and stderr are streamed independently and preserved separately.
+- Secret redaction tail holdback is conditional: only suspicious trailing secret-prefix bytes are delayed, for at most `200ms`.
 
 ## Secret Redaction
 

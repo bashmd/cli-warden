@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{mpsc, Semaphore},
+    time::{sleep_until, Duration, Instant as TokioInstant},
 };
 use tokio_stream::Stream;
 use tonic::{
@@ -113,6 +114,7 @@ struct WardenService {
 
 type StreamEventItem = Result<ExecuteStreamEvent, Status>;
 type StreamEventQueueItem = QueuedItem<StreamEventItem>;
+const SECRET_TAIL_HOLD_TIMEOUT_MS: u64 = 200;
 
 enum GateResult {
     Allow(Decision),
@@ -875,23 +877,56 @@ where
     let mut read_buf = vec![0u8; DEFAULT_CHUNK_BYTES];
     let mut utf8_pending = Vec::new();
     let mut redaction_pending = String::new();
+    let mut hold_deadline: Option<TokioInstant> = None;
 
     loop {
-        match reader.read(&mut read_buf).await {
+        let read_result = if let Some(deadline) = hold_deadline {
+            tokio::select! {
+                _ = sleep_until(deadline) => {
+                    flush_pending_text(
+                        &mut redaction_pending,
+                        false,
+                        0,
+                        &redactor,
+                        &tx,
+                        &byte_budget,
+                        event_builder,
+                    )
+                    .await?;
+                    hold_deadline = None;
+                    continue;
+                }
+                read = reader.read(&mut read_buf) => read,
+            }
+        } else {
+            reader.read(&mut read_buf).await
+        };
+
+        match read_result {
             Ok(0) => break,
             Ok(n) => {
                 utf8_pending.extend_from_slice(&read_buf[..n]);
                 drain_utf8_into_text(&mut utf8_pending, &mut redaction_pending)?;
+                let tail_hold_len = redactor.trailing_secret_prefix_len(&redaction_pending);
 
                 flush_pending_text(
                     &mut redaction_pending,
                     false,
+                    tail_hold_len,
                     &redactor,
                     &tx,
                     &byte_budget,
                     event_builder,
                 )
                 .await?;
+
+                if tail_hold_len > 0 {
+                    hold_deadline = Some(
+                        TokioInstant::now() + Duration::from_millis(SECRET_TAIL_HOLD_TIMEOUT_MS),
+                    );
+                } else {
+                    hold_deadline = None;
+                }
             }
             Err(e) => return Err(format!("{stream_name} read failed: {e}")),
         }
@@ -907,6 +942,7 @@ where
     flush_pending_text(
         &mut redaction_pending,
         true,
+        0,
         &redactor,
         &tx,
         &byte_budget,
@@ -948,12 +984,13 @@ fn drain_utf8_into_text(utf8_pending: &mut Vec<u8>, text_out: &mut String) -> Re
 async fn flush_pending_text(
     text: &mut String,
     flush_all: bool,
+    tail_hold_len: usize,
     redactor: &Redactor,
     tx: &mpsc::Sender<StreamEventQueueItem>,
     byte_budget: &Arc<Semaphore>,
     event_builder: fn(String) -> ExecuteStreamEvent,
 ) -> Result<(), String> {
-    let emit_until = stable_emit_len(text, flush_all, redactor);
+    let emit_until = flush_emit_len(text, flush_all, tail_hold_len);
     if emit_until == 0 {
         return Ok(());
     }
@@ -963,6 +1000,13 @@ async fn flush_pending_text(
 
     let redacted = redactor.redact_text(&emit_text);
     send_text_events(tx, byte_budget, event_builder, redacted).await
+}
+
+fn flush_emit_len(text: &str, flush_all: bool, tail_hold_len: usize) -> usize {
+    if flush_all {
+        return text.len();
+    }
+    text.len().saturating_sub(tail_hold_len.min(text.len()))
 }
 
 async fn send_text_events(
@@ -991,20 +1035,6 @@ async fn send_text_events(
     Ok(())
 }
 
-fn stable_emit_len(text: &str, flush_all: bool, redactor: &Redactor) -> usize {
-    if flush_all {
-        return text.len();
-    }
-
-    let stable_by_redaction = redactor.stable_prefix_len(text);
-
-    // Secrets are loaded line-by-line, so they cannot contain '\n'. Any complete line can be
-    // emitted immediately without risking cross-boundary secret matching.
-    let stable_by_line = text.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-
-    stable_by_redaction.max(stable_by_line)
-}
-
 async fn send_done(
     tx: &mpsc::Sender<StreamEventQueueItem>,
     outcome: Outcome,
@@ -1026,36 +1056,21 @@ async fn send_done(
 
 #[cfg(test)]
 mod tests {
-    use super::stable_emit_len;
-    use crate::redaction::Redactor;
+    use super::flush_emit_len;
 
     #[test]
-    fn stable_emit_len_flushes_complete_lines_even_with_long_secret_window() {
-        let redactor = Redactor::from_secrets(vec!["this-is-a-very-long-secret-token".to_string()])
-            .expect("redactor");
-        let text = "first line complete\npartial";
-
-        let emit = stable_emit_len(text, false, &redactor);
-        assert_eq!(emit, "first line complete\n".len());
+    fn flush_emit_len_keeps_tail_when_hold_is_active() {
+        assert_eq!(flush_emit_len("abcdef", false, 2), 4);
     }
 
     #[test]
-    fn stable_emit_len_keeps_partial_no_newline_when_secret_window_not_stable() {
-        let redactor = Redactor::from_secrets(vec!["this-is-a-very-long-secret-token".to_string()])
-            .expect("redactor");
-        let text = "short-fragment";
-
-        let emit = stable_emit_len(text, false, &redactor);
-        assert_eq!(emit, 0);
+    fn flush_emit_len_flushes_all_when_hold_is_zero() {
+        assert_eq!(flush_emit_len("abcdef", false, 0), 6);
     }
 
     #[test]
-    fn stable_emit_len_flush_all_overrides_stability() {
-        let redactor = Redactor::from_secrets(vec!["abc".to_string()]).expect("redactor");
-        let text = "tail";
-
-        let emit = stable_emit_len(text, true, &redactor);
-        assert_eq!(emit, text.len());
+    fn flush_emit_len_flush_all_ignores_tail_hold() {
+        assert_eq!(flush_emit_len("abcdef", true, 3), 6);
     }
 }
 
