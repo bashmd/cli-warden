@@ -953,11 +953,7 @@ async fn flush_pending_text(
     byte_budget: &Arc<Semaphore>,
     event_builder: fn(String) -> ExecuteStreamEvent,
 ) -> Result<(), String> {
-    let emit_until = if flush_all {
-        text.len()
-    } else {
-        redactor.stable_prefix_len(text)
-    };
+    let emit_until = stable_emit_len(text, flush_all, redactor);
     if emit_until == 0 {
         return Ok(());
     }
@@ -995,6 +991,20 @@ async fn send_text_events(
     Ok(())
 }
 
+fn stable_emit_len(text: &str, flush_all: bool, redactor: &Redactor) -> usize {
+    if flush_all {
+        return text.len();
+    }
+
+    let stable_by_redaction = redactor.stable_prefix_len(text);
+
+    // Secrets are loaded line-by-line, so they cannot contain '\n'. Any complete line can be
+    // emitted immediately without risking cross-boundary secret matching.
+    let stable_by_line = text.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+
+    stable_by_redaction.max(stable_by_line)
+}
+
 async fn send_done(
     tx: &mpsc::Sender<StreamEventQueueItem>,
     outcome: Outcome,
@@ -1012,6 +1022,41 @@ async fn send_done(
         }),
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stable_emit_len;
+    use crate::redaction::Redactor;
+
+    #[test]
+    fn stable_emit_len_flushes_complete_lines_even_with_long_secret_window() {
+        let redactor = Redactor::from_secrets(vec!["this-is-a-very-long-secret-token".to_string()])
+            .expect("redactor");
+        let text = "first line complete\npartial";
+
+        let emit = stable_emit_len(text, false, &redactor);
+        assert_eq!(emit, "first line complete\n".len());
+    }
+
+    #[test]
+    fn stable_emit_len_keeps_partial_no_newline_when_secret_window_not_stable() {
+        let redactor = Redactor::from_secrets(vec!["this-is-a-very-long-secret-token".to_string()])
+            .expect("redactor");
+        let text = "short-fragment";
+
+        let emit = stable_emit_len(text, false, &redactor);
+        assert_eq!(emit, 0);
+    }
+
+    #[test]
+    fn stable_emit_len_flush_all_overrides_stability() {
+        let redactor = Redactor::from_secrets(vec!["abc".to_string()]).expect("redactor");
+        let text = "tail";
+
+        let emit = stable_emit_len(text, true, &redactor);
+        assert_eq!(emit, text.len());
+    }
 }
 
 fn resp(
