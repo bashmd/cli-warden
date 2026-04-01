@@ -70,10 +70,38 @@ pub async fn run_daemon(config_path: PathBuf) -> anyhow::Result<()> {
     Server::builder()
         .tls_config(tls)?
         .add_service(WardenServer::new(svc))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    error!("failed to register SIGTERM handler: {e}");
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("shutdown signal received");
+                    return;
+                }
+            };
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    info!("shutdown signal received");
 }
 
 #[derive(Clone)]

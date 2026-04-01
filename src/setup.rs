@@ -8,6 +8,7 @@ use rcgen::{
 use std::{
     collections::BTreeMap,
     fs,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
 };
 
@@ -39,6 +40,7 @@ pub fn run_setup(opts: SetupOptions) -> anyhow::Result<()> {
             .default("0.0.0.0:50051".to_string())
             .interact_text()?,
     };
+    let listen = normalize_listen_addr(&listen)?;
 
     let server_domain = match opts.server_domain {
         Some(v) => v,
@@ -85,7 +87,7 @@ pub fn run_setup(opts: SetupOptions) -> anyhow::Result<()> {
     fs::write(&client_cert_path, client.cert_pem)?;
     fs::write(&client_key_path, client.key_pem)?;
 
-    let server_uri = server_uri_from_listen(&listen, &server_domain)?;
+    let server_uri = server_uri_from_listen(listen.port(), &server_domain)?;
 
     let secrets_file = out_dir.join("secrets.txt");
     if !secrets_file.exists() {
@@ -94,7 +96,7 @@ pub fn run_setup(opts: SetupOptions) -> anyhow::Result<()> {
 
     let daemon_cfg = DaemonConfig {
         server: ServerConfig {
-            listen: listen.clone(),
+            listen: listen.to_string(),
             tls_cert_path: daemon_cert_path.display().to_string(),
             tls_key_path: daemon_key_path.display().to_string(),
             client_ca_cert_path: ca_cert_path.display().to_string(),
@@ -190,11 +192,32 @@ fn print_client_bootstrap(cfg: &ClientConfig) {
     println!("EOF\n");
 }
 
-fn server_uri_from_listen(listen: &str, domain: &str) -> anyhow::Result<String> {
-    let mut split = listen.rsplitn(2, ':');
-    let port = split
-        .next()
-        .ok_or_else(|| anyhow!("invalid listen address '{}': missing port", listen))?;
+fn normalize_listen_addr(listen: &str) -> anyhow::Result<SocketAddr> {
+    let trimmed = listen.trim();
+    if trimmed.is_empty() {
+        bail!("invalid listen address: value is empty");
+    }
+
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let mut resolved = trimmed
+        .to_socket_addrs()
+        .with_context(|| format!("invalid listen address '{}'", listen))?;
+    resolved.next().ok_or_else(|| {
+        anyhow!(
+            "invalid listen address '{}': resolved to no addresses",
+            listen
+        )
+    })
+}
+
+fn server_uri_from_listen(port: u16, domain: &str) -> anyhow::Result<String> {
+    let domain = domain.trim();
+    if domain.is_empty() {
+        bail!("invalid server domain: value is empty");
+    }
     Ok(format!("https://{}:{}", domain, port))
 }
 
@@ -276,4 +299,39 @@ fn make_client_cert(
         cert_pem: cert.pem(),
         key_pem: leaf_key.serialize_pem(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_listen_addr, server_uri_from_listen};
+    use std::net::IpAddr;
+
+    #[test]
+    fn normalize_listen_accepts_ip_socket_addr() {
+        let addr = normalize_listen_addr("127.0.0.1:50051").expect("must parse");
+        assert_eq!(addr.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(addr.port(), 50051);
+    }
+
+    #[test]
+    fn normalize_listen_accepts_hostname() {
+        let addr = normalize_listen_addr("localhost:50051").expect("must resolve");
+        assert_eq!(addr.port(), 50051);
+        assert!(addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn normalize_listen_rejects_missing_port() {
+        let err = normalize_listen_addr("localhost").expect_err("must fail");
+        assert!(
+            err.to_string().contains("invalid listen address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn server_uri_uses_domain_and_port() {
+        let uri = server_uri_from_listen(50051, "localhost").expect("must build uri");
+        assert_eq!(uri, "https://localhost:50051");
+    }
 }

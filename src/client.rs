@@ -28,8 +28,9 @@ enum StdinSource {
 }
 
 pub async fn run_list_commands(config_path: PathBuf) -> anyhow::Result<()> {
-    let cfg = ClientConfig::load(&config_path)
-        .with_context(|| format!("failed loading client config {}", config_path.display()))?;
+    let cfg_path = expand_tilde_path(&config_path);
+    let cfg = ClientConfig::load(&cfg_path)
+        .with_context(|| format!("failed loading client config {}", cfg_path.display()))?;
     let mut client = connect(&cfg).await?;
 
     let resp = client
@@ -51,8 +52,9 @@ pub async fn run_execute(
     intent: Option<String>,
     stdin_utf8: Option<String>,
 ) -> anyhow::Result<()> {
-    let cfg = ClientConfig::load(&config_path)
-        .with_context(|| format!("failed loading client config {}", config_path.display()))?;
+    let cfg_path = expand_tilde_path(&config_path);
+    let cfg = ClientConfig::load(&cfg_path)
+        .with_context(|| format!("failed loading client config {}", cfg_path.display()))?;
 
     let stdin_bytes = stdin_utf8.unwrap_or_default().into_bytes();
     let done = execute_stream(
@@ -80,8 +82,9 @@ pub async fn run_install_shims(
     dir: PathBuf,
     force: bool,
 ) -> anyhow::Result<()> {
-    let cfg = ClientConfig::load(&config_path)
-        .with_context(|| format!("failed loading client config {}", config_path.display()))?;
+    let cfg_path = expand_tilde_path(&config_path);
+    let cfg = ClientConfig::load(&cfg_path)
+        .with_context(|| format!("failed loading client config {}", cfg_path.display()))?;
     let mut client = connect(&cfg).await?;
     let resp = client
         .list_commands(pb::ListCommandsRequest {})
@@ -119,8 +122,9 @@ pub async fn run_shim(
     args: Vec<String>,
     intent: Option<String>,
 ) -> anyhow::Result<i32> {
-    let cfg = ClientConfig::load(&config_path)
-        .with_context(|| format!("failed loading client config {}", config_path.display()))?;
+    let cfg_path = expand_tilde_path(&config_path);
+    let cfg = ClientConfig::load(&cfg_path)
+        .with_context(|| format!("failed loading client config {}", cfg_path.display()))?;
 
     let done = execute_stream(
         &cfg,
@@ -324,6 +328,11 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn expand_tilde_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    expand_tilde(&raw)
+}
+
 #[cfg(unix)]
 fn create_symlink(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::os::unix::fs::symlink(src, dst)?;
@@ -333,4 +342,24 @@ fn create_symlink(src: &Path, dst: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn create_symlink(_src: &Path, _dst: &Path) -> anyhow::Result<()> {
     bail!("shim installation via symlink is currently only supported on unix")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde_path;
+    use std::path::Path;
+
+    #[test]
+    fn expand_tilde_path_expands_home_prefix() {
+        let p = expand_tilde_path(Path::new("~/cli-warden-test/client.toml"));
+        assert!(
+            !p.to_string_lossy().starts_with("~/"),
+            "tilde must be expanded"
+        );
+        assert!(
+            p.to_string_lossy().contains("cli-warden-test/client.toml"),
+            "unexpected expanded path: {}",
+            p.display()
+        );
+    }
 }
